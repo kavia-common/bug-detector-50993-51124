@@ -6,7 +6,7 @@ import io
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import AsyncGenerator, Dict, List, Optional, Sequence
+from typing import AsyncGenerator, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, Security
@@ -26,8 +26,7 @@ import hmac
 # --------------------------------------------------------------------------------------
 
 class Settings(BaseModel):
-    """Runtime configuration loaded from environment and db_connection.txt.
-    """
+    """Runtime configuration loaded from environment and db_connection.txt."""
     app_name: str = "Bug Detector Backend API"
     app_version: str = "1.0.0"
     jwt_secret: str = Field(default="change-me", description="Secret used to sign JWTs")
@@ -55,11 +54,14 @@ def load_settings() -> Settings:
     # database: priority .env DATABASE_DSN, then DATABASE_URL, then db_connection.txt parsing, else default sqlite
     db_url = os.getenv("DATABASE_DSN") or os.getenv("DATABASE_URL")
     if not db_url:
-        # domain instruction: ALWAYS read connection from db_connection.txt if present
-        db_file = os.path.join(os.path.dirname(__file__), "..", "..", "db_connection.txt")
-        # also check container root
-        alt_db_file = os.path.join(os.path.dirname(__file__), "..", "db_connection.txt")
-        for candidate in [db_file, alt_db_file, "db_connection.txt"]:
+        # ALWAYS read connection from db_connection.txt if present
+        here = os.path.dirname(__file__)
+        candidates = [
+            os.path.join(here, "..", "..", "db_connection.txt"),
+            os.path.join(here, "..", "db_connection.txt"),
+            "db_connection.txt",
+        ]
+        for candidate in candidates:
             if os.path.exists(candidate):
                 try:
                     with open(candidate, "r", encoding="utf-8") as f:
@@ -68,7 +70,7 @@ def load_settings() -> Settings:
                     if "postgresql://" in txt:
                         start = txt.find("postgresql://")
                         db_url = txt[start:].strip()
-                        # ensure async driver
+                        # ensure async driver for SQLAlchemy
                         if db_url.startswith("postgresql://"):
                             db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
                         break
@@ -117,6 +119,7 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# Enable CORS using FRONTEND_ORIGIN or defaults
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -393,6 +396,15 @@ async def log_action(session: AsyncSession, user_id: Optional[int], action: str,
     session.add(AuditLog(user_id=user_id, action=action, target_type=target_type, target_id=target_id, details=details))
     await session.commit()
 
+async def _ping_service(url: str, path: str = "/") -> Tuple[bool, Optional[int], Optional[str]]:
+    """Ping an external service returning (ok, status_code, error_or_none)."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url.rstrip("/") + path)
+            return (200 <= resp.status_code < 300, resp.status_code, None)
+    except Exception as e:
+        return (False, None, str(e))
+
 # --------------------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------------------
@@ -405,6 +417,41 @@ def health_check():
         JSON: {"message": "Healthy"}
     """
     return {"message": "Healthy"}
+
+@app.get(
+    "/health/integration",
+    tags=["health"],
+    summary="Integration Health",
+    description="Checks DB connectivity and reachability of SourceCodeAnalysisEngine and IntegrationService.",
+)
+async def integration_health(session: AsyncSession = Depends(get_session)):
+    """Return status for DB, AnalysisEngine and IntegrationService."""
+    # DB check
+    db_ok = True
+    db_err = None
+    try:
+        await session.execute(select(func.count()).select_from(User))
+    except Exception as e:
+        db_ok = False
+        db_err = str(e)
+
+    analysis_ok, analysis_status, analysis_err = await _ping_service(settings.analysis_engine_url, "/metrics" if settings.analysis_engine_url else "/")
+    if analysis_status is None:
+        # try root if metrics unavailable
+        analysis_ok_fallback, analysis_status_fb, analysis_err_fb = await _ping_service(settings.analysis_engine_url, "/")
+        if analysis_status is None:
+            analysis_ok, analysis_status, analysis_err = analysis_ok_fallback, analysis_status_fb, analysis_err_fb
+
+    integ_ok, integ_status, integ_err = await _ping_service(settings.integration_service_url, "/integrations/endpoints" if settings.integration_service_url else "/")
+
+    status = {
+        "database": {"ok": db_ok, "error": db_err},
+        "analysis_engine": {"ok": analysis_ok, "status": analysis_status, "error": analysis_err},
+        "integration_service": {"ok": integ_ok, "status": integ_status, "error": integ_err},
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    http_status = 200 if db_ok and analysis_ok and integ_ok else 503
+    return Response(content=json.dumps(status), media_type="application/json", status_code=http_status)
 
 # AUTH
 @app.post("/auth/register", tags=["auth"], status_code=201, summary="Register a new user")
@@ -541,16 +588,25 @@ async def submit_job(req: JobRequest, current: User = Depends(get_current_user),
     session.add(job)
     await session.commit()
     await session.refresh(job)
+    engine_job_id: Optional[str] = None
     # notify engine
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            payload = {"repo_url": req.repository_url, "language": req.language, "branch": req.branch}
-            r = await client.post(f"{settings.analysis_engine_url}/analyze", data=payload)
-            _ = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            # engine expects multipart/form-data; send minimal fields as such
+            form = {"repo_url": req.repository_url, "language": req.language, "branch": req.branch}
+            r = await client.post(f"{settings.analysis_engine_url}/analyze", data=form)
+            if r.headers.get("content-type", "").startswith("application/json"):
+                payload = r.json()
+                engine_job_id = str(payload.get("job_id")) if payload else None
         except Exception:
+            # swallow; health endpoint will reveal connectivity issues
             pass
-    await log_action(session, current.id, "submit", "AnalysisJob", job.id, details=f"{req.repository_url}@{req.branch}")
-    return {"job_id": str(job.id), "status": "accepted"}
+    # Store analysis engine job id if we have it, via SystemConfig as a simple kv for demo
+    if engine_job_id:
+        session.add(SystemConfig(key=f"analysis.job.{job.id}.engine_id", value=engine_job_id))
+        await session.commit()
+    await log_action(session, current.id, "submit", "AnalysisJob", job.id, details=f"{req.repository_url}@{req.branch}, engine_job_id={engine_job_id}")
+    return {"job_id": str(job.id), "engine_job_id": engine_job_id, "status": "accepted"}
 
 @app.get("/jobs", tags=["jobs"], summary="List analysis jobs")
 async def list_jobs(current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
@@ -558,7 +614,45 @@ async def list_jobs(current: User = Depends(get_current_user), session: AsyncSes
     await require_permissions(["jobs:read"], current, session)
     res = await session.execute(select(AnalysisJob))
     jobs = res.scalars().all()
-    return [{"id": j.id, "status": j.status, "created_by": j.created_by, "created_at": j.created_at} for j in jobs]
+    # enrich with engine job id if available
+    enriched = []
+    for j in jobs:
+        cfg = await session.get(SystemConfig, f"analysis.job.{j.id}.engine_id")
+        enriched.append({
+            "id": j.id,
+            "status": j.status,
+            "created_by": j.created_by,
+            "created_at": j.created_at,
+            "engine_job_id": cfg.value if cfg else None,
+        })
+    return enriched
+
+@app.get("/jobs/{job_id}", tags=["jobs"], summary="Get job details and engine results")
+async def get_job(job_id: int, current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Get job details. Will fetch analysis results from SourceCodeAnalysisEngine if engine_job_id is known. Requires 'jobs:read'."""
+    await require_permissions(["jobs:read"], current, session)
+    job = await session.get(AnalysisJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    engine_id_cfg = await session.get(SystemConfig, f"analysis.job.{job.id}.engine_id")
+    engine_job_id = engine_id_cfg.value if engine_id_cfg else None
+    engine_results = None
+    if engine_job_id:
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                r = await client.get(f"{settings.analysis_engine_url}/results/{engine_job_id}")
+                if r.headers.get("content-type", "").startswith("application/json"):
+                    engine_results = r.json()
+            except Exception:
+                engine_results = None
+    return {
+        "id": job.id,
+        "status": job.status,
+        "created_by": job.created_by,
+        "created_at": job.created_at,
+        "engine_job_id": engine_job_id,
+        "engine_results": engine_results,
+    }
 
 # REPORTS
 @app.get("/reports", tags=["reports"], summary="List bug reports")
