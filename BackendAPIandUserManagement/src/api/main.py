@@ -37,13 +37,23 @@ class Settings(BaseModel):
     database_url: str = "sqlite+aiosqlite:///./dev.db"
     analysis_engine_url: str = "http://localhost:3001"
     integration_service_url: str = "http://localhost:3003"
+    backend_base_url: Optional[str] = None
 
 # PUBLIC_INTERFACE
 def load_settings() -> Settings:
-    """Load settings from .env and db_connection.txt if present."""
+    """Load settings from .env and db_connection.txt if present.
+
+    Environment variables:
+    - DATABASE_DSN (preferred) or DATABASE_URL: async SQLAlchemy URL, e.g., postgresql+asyncpg://...
+    - JWT_SECRET: JWT signing secret
+    - FRONTEND_ORIGIN: single origin or comma-separated list for CORS
+    - ANALYSIS_ENGINE_URL: base URL to SourceCodeAnalysisEngine
+    - INTEGRATION_SERVICE_URL: base URL to IntegrationService
+    - BACKEND_BASE_URL: public base URL for this backend (optional)
+    """
     load_dotenv()
-    # database: priority .env DATABASE_URL, then db_connection.txt parsing, else default sqlite
-    db_url = os.getenv("DATABASE_URL")
+    # database: priority .env DATABASE_DSN, then DATABASE_URL, then db_connection.txt parsing, else default sqlite
+    db_url = os.getenv("DATABASE_DSN") or os.getenv("DATABASE_URL")
     if not db_url:
         # domain instruction: ALWAYS read connection from db_connection.txt if present
         db_file = os.path.join(os.path.dirname(__file__), "..", "..", "db_connection.txt")
@@ -68,16 +78,19 @@ def load_settings() -> Settings:
         db_url = "sqlite+aiosqlite:///./dev.db"
 
     jwt_secret = os.getenv("JWT_SECRET", "change-me")
-    cors = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+    # prefer FRONTEND_ORIGIN, fallback to CORS_ORIGINS
+    cors = os.getenv("FRONTEND_ORIGIN") or os.getenv("CORS_ORIGINS", "http://localhost:3000")
     cors_list = [c.strip() for c in cors.split(",") if c.strip()]
     analysis_url = os.getenv("ANALYSIS_ENGINE_URL", "http://localhost:3001")
     integration_url = os.getenv("INTEGRATION_SERVICE_URL", "http://localhost:3003")
+    backend_base = os.getenv("BACKEND_BASE_URL")
     return Settings(
         database_url=db_url,
         jwt_secret=jwt_secret,
         cors_origins=cors_list or ["http://localhost:3000"],
         analysis_engine_url=analysis_url,
         integration_service_url=integration_url,
+        backend_base_url=backend_base,
     )
 
 settings = load_settings()
@@ -167,7 +180,9 @@ class BugReport(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
+    # expected enums by schema: low, medium, high, critical
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    # expected enums by schema: open, in_progress, resolved, closed
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     assigned_to: Mapped[Optional[int]] = mapped_column(ForeignKey("User.id"))
     created_by: Mapped[int] = mapped_column(ForeignKey("User.id"), nullable=False)
@@ -235,6 +250,7 @@ engine: AsyncEngine = create_async_engine(settings.database_url, echo=False, poo
 session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
+    """Yield an AsyncSession for database access."""
     async with session_factory() as session:
         yield session
 
@@ -383,7 +399,11 @@ async def log_action(session: AsyncSession, user_id: Optional[int], action: str,
 
 @app.get("/", tags=["health"], summary="Health Check")
 def health_check():
-    """Health endpoint to verify service responsiveness."""
+    """Health endpoint to verify service responsiveness.
+
+    Returns:
+        JSON: {"message": "Healthy"}
+    """
     return {"message": "Healthy"}
 
 # AUTH
@@ -524,7 +544,8 @@ async def submit_job(req: JobRequest, current: User = Depends(get_current_user),
     # notify engine
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            r = await client.post(f"{settings.analysis_engine_url}/analyze", data={"repo_url": req.repository_url, "language": req.language})
+            payload = {"repo_url": req.repository_url, "language": req.language, "branch": req.branch}
+            r = await client.post(f"{settings.analysis_engine_url}/analyze", data=payload)
             _ = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
         except Exception:
             pass
@@ -586,6 +607,60 @@ async def create_report(req: BugReportRequest, current: User = Depends(get_curre
     await session.refresh(report)
     await log_action(session, current.id, "create", "BugReport", report.id)
     return {"id": report.id}
+
+@app.get("/reports/{report_id}", tags=["reports"], summary="Get bug report")
+async def get_report(report_id: int, current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Retrieve a bug report by id. Requires 'reports:read'."""
+    await require_permissions(["reports:read"], current, session)
+    obj = await session.get(BugReport, report_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {
+        "id": obj.id,
+        "title": obj.title,
+        "description": obj.description,
+        "severity": obj.severity,
+        "status": obj.status,
+        "assigned_to": obj.assigned_to,
+        "created_by": obj.created_by,
+        "created_at": obj.created_at,
+        "updated_at": obj.updated_at,
+    }
+
+class BugReportUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    severity: Optional[str] = None
+    status: Optional[str] = None
+    assigned_to: Optional[int] = None
+
+@app.put("/reports/{report_id}", tags=["reports"], summary="Update bug report")
+async def update_report(report_id: int, payload: BugReportUpdate, current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Update a bug report. Requires 'reports:write'."""
+    await require_permissions(["reports:write"], current, session)
+    obj = await session.get(BugReport, report_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Report not found")
+    changed_fields = []
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, field, value)
+        changed_fields.append(field)
+    await session.commit()
+    await session.refresh(obj)
+    await log_action(session, current.id, "update", "BugReport", obj.id, details=f"fields={','.join(changed_fields)}")
+    return {"id": obj.id, "updated": True}
+
+@app.delete("/reports/{report_id}", tags=["reports"], status_code=204, summary="Delete bug report")
+async def delete_report(report_id: int, current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Delete a bug report. Requires 'reports:write'."""
+    await require_permissions(["reports:write"], current, session)
+    obj = await session.get(BugReport, report_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Report not found")
+    await session.delete(obj)
+    await session.commit()
+    await log_action(session, current.id, "delete", "BugReport", report_id)
+    return Response(status_code=204)
 
 @app.get("/reports/export", tags=["reports"], summary="Export bug reports")
 async def export_reports(
@@ -715,15 +790,17 @@ async def on_startup():
 # --------------------------------------------------------------------------------------
 
 @app.get("/_stubs/analysis/results/{job_id}", tags=["jobs"], summary="Fetch analysis results (stub passthrough)")
-async def fetch_analysis_results(job_id: str, current: User = Depends(get_current_user)):
-    """Passthrough to SourceCodeAnalysisEngine /results/{job_id}."""
+async def fetch_analysis_results(job_id: str, current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Passthrough to SourceCodeAnalysisEngine /results/{job_id}. Requires 'jobs:read'."""
+    await require_permissions(["jobs:read"], current, session)
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(f"{settings.analysis_engine_url}/results/{job_id}")
         return r.json() if r.headers.get("content-type","").startswith("application/json") else {"status": r.status_code}
 
 @app.get("/_stubs/integrations/endpoints", tags=["notifications"], summary="List integration endpoints (stub)")
-async def list_integration_endpoints(current: User = Depends(get_current_user)):
-    """Passthrough to IntegrationService /integrations/endpoints."""
+async def list_integration_endpoints(current: User = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    """Passthrough to IntegrationService /integrations/endpoints. Requires 'notifications:write' (or a dedicated 'notifications:read' if defined)."""
+    await require_permissions(["notifications:write"], current, session)
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(f"{settings.integration_service_url}/integrations/endpoints")
         return r.json() if r.headers.get("content-type","").startswith("application/json") else {"status": r.status_code}
